@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -70,11 +71,12 @@ _STATIC_FEATURE_FLAGS = {
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
-    "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "skills_api": True, "audio_api": True, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
 _CAPABILITY_ENDPOINTS = (
+    ("audio_transcriptions", ("POST", "/v1/audio/transcriptions")),
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
     ("chat_completions", ("POST", "/v1/chat/completions")),
@@ -1520,6 +1522,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            # OpenAI-compatible STT: reuses the local Whisper pipeline so a
+            # client can transcribe over the same port/API key as the rest
+            # of this server instead of the dashboard web server.
+            ("POST", "/v1/audio/transcriptions", self._handle_audio_transcriptions),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2622,6 +2628,128 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             body=data, status=200, content_type=receipt.content_type,
             headers={"X-Artifact-Sha256": receipt.sha256, "X-Artifact-Id": receipt.artifact_id,
                      "Content-Disposition": f'attachment; filename="{receipt.filename}"'})
+
+    async def _handle_audio_transcriptions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text.
+
+        Reuses the same local Whisper pipeline as the dashboard's
+        ``POST /api/audio/transcribe`` (``tools.voice_mode.transcribe_recording``)
+        so an external client can transcribe audio over this server's own
+        port and ``API_SERVER_KEY`` instead of making a separate hop to the
+        dashboard web server.
+
+        The request is ``multipart/form-data``; the required ``file`` part
+        is streamed to a temp file in bounded chunks (never buffered whole
+        via an unbounded ``.read()``). ``model`` is forwarded to the
+        pipeline as-is; ``language``, ``response_format``, ``prompt``, and
+        ``temperature`` are accepted and ignored — OpenAI SDK clients send
+        them routinely and should not get a 400 for it.
+
+        Transcription itself is a synchronous call that shells out to the
+        local Whisper binary and can take 10-25s, so it runs via
+        ``run_in_executor`` off the event loop; otherwise one transcription
+        would stall every concurrent agent run and SSE stream sharing this
+        port.
+
+        Status ladder: 401 bad/missing Bearer, 400 not multipart / missing
+        ``file`` part, 413 body over this server's global request cap
+        (enforced by ``body_limit_middleware``; surfaced here only if it
+        reaches the handler), 500 transcription failure, 200 success. An
+        empty ``text`` (silence, or a filtered Whisper hallucination) is a
+        deliberate 200, not an error — matching the dashboard endpoint.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            reader = await request.multipart()
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Request must be multipart/form-data.",
+                    code="invalid_content_type",
+                ),
+                status=400,
+            )
+
+        temp_path: Optional[str] = None
+        model_name: Optional[str] = None
+        got_file = False
+        try:
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "file":
+                    got_file = True
+                    suffix = os.path.splitext(part.filename or "")[1] or ".wav"
+                    tmp = tempfile.NamedTemporaryFile(
+                        prefix="hermes-api-transcribe-", suffix=suffix, delete=False
+                    )
+                    temp_path = tmp.name
+                    try:
+                        while True:
+                            chunk = await part.read_chunk(size=65536)
+                            if not chunk:
+                                break
+                            tmp.write(chunk)
+                    finally:
+                        tmp.close()
+                elif part.name == "model":
+                    model_name = (await part.text()).strip() or None
+                else:
+                    # language / response_format / prompt / temperature /
+                    # anything else an OpenAI client sends — drain, ignore.
+                    await part.read()
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except Exception:
+            logger.exception("POST /v1/audio/transcriptions: failed reading multipart body")
+            return web.json_response(
+                _openai_error("Failed to read multipart request body."), status=400
+            )
+
+        if not got_file or not temp_path:
+            return web.json_response(
+                _openai_error("Missing required 'file' part.", param="file"),
+                status=400,
+            )
+
+        loop = asyncio.get_running_loop()
+        request_profile = _api_request_profile.get()
+
+        def _transcribe():
+            from tools.voice_mode import transcribe_recording
+
+            with self._profile_scope(request_profile):
+                return transcribe_recording(temp_path, model=model_name)
+
+        try:
+            result = await loop.run_in_executor(None, _transcribe)
+        except Exception as exc:
+            logger.exception("POST /v1/audio/transcriptions: transcription failed")
+            return web.json_response(
+                _openai_error(f"Transcription failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+        if not result.get("success"):
+            error = result.get("error") or "Transcription failed"
+            return web.json_response(
+                _openai_error(error, err_type="server_error"), status=500
+            )
+
+        response: Dict[str, Any] = {"text": str(result.get("transcript") or "")}
+        provider = result.get("provider")
+        if provider:
+            response["provider"] = provider
+        return web.json_response(response)
 
     @_require_auth
     async def _handle_skills(self, request: "web.Request") -> "web.Response":

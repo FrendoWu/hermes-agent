@@ -17,13 +17,14 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -311,6 +312,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/model/options", adapter._handle_model_options)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
+    app.router.add_post("/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -972,6 +974,276 @@ class TestToolsetsEndpoint:
             call.kwargs["features"] is feature_snapshot
             for call in has_keys.call_args_list
         )
+
+
+# ---------------------------------------------------------------------------
+# /v1/audio/transcriptions endpoint — LOCAL PATCH, not upstream.
+#
+# Lives on branch local/stt-endpoint so the AI Passport badge's bridge can
+# reach speech-to-text over this server's own port and API_SERVER_KEY instead
+# of the dashboard web server's session-cookie route. Keeping the whole local
+# surface (handler, capability flag, endpoints entry, these tests) in single
+# contiguous blocks is deliberate: it is what makes the rebase onto a moved
+# upstream main a one-hunk operation instead of an archaeology exercise.
+# ---------------------------------------------------------------------------
+
+
+class TestAudioTranscriptionsEndpoint:
+
+    WAV = b"RIFF$\x00\x00\x00WAVEfmt " + b"\x00" * 16 + b"data" + b"\x01\x02" * 8
+
+    @staticmethod
+    def _pipeline(result, capture=None):
+        """Stand in for tools.voice_mode.transcribe_recording.
+
+        Records what the handler handed the pipeline, so the tests can assert
+        on the temp file's contents and on which thread the call landed.
+        """
+
+        def _call(wav_path, model=None):
+            if capture is not None:
+                capture["path"] = wav_path
+                capture["model"] = model
+                capture["thread"] = threading.current_thread()
+                with open(wav_path, "rb") as fh:
+                    capture["bytes"] = fh.read()
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return _call
+
+    def _form(self, *, filename="turn.wav", extras=None):
+        form = FormData()
+        form.add_field("file", self.WAV, filename=filename, content_type="audio/wav")
+        for name, value in (extras or {}).items():
+            form.add_field(name, value)
+        return form
+
+    @pytest.mark.asyncio
+    async def test_returns_openai_text_shape(self, adapter):
+        pipeline = self._pipeline({"success": True, "transcript": "hello badge", "provider": "whisper.cpp"})
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["text"] == "hello badge"
+                assert data["provider"] == "whisper.cpp"
+
+    @pytest.mark.asyncio
+    async def test_omits_provider_when_pipeline_reports_none(self, adapter):
+        """``provider`` is a non-standard extra; absent means absent, not null,
+        so an OpenAI-shaped client never sees a key it cannot type."""
+        pipeline = self._pipeline({"success": True, "transcript": "ok"})
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 200
+                assert await resp.json() == {"text": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_uploaded_bytes_reach_the_pipeline_on_disk(self, adapter):
+        """The file part is streamed to a temp file in bounded chunks; the
+        pipeline must see those exact bytes, with the upload's suffix kept so
+        the Whisper binary still recognises the container."""
+        capture = {}
+        pipeline = self._pipeline({"success": True, "transcript": "x"}, capture)
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 200
+        assert capture["bytes"] == self.WAV
+        assert capture["path"].endswith(".wav")
+
+    @pytest.mark.asyncio
+    async def test_unnamed_upload_still_gets_a_wav_suffix(self, adapter):
+        capture = {}
+        pipeline = self._pipeline({"success": True, "transcript": "x"}, capture)
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form(filename="capture"))
+                assert resp.status == 200
+        assert capture["path"].endswith(".wav")
+
+    @pytest.mark.asyncio
+    async def test_runs_the_pipeline_off_the_event_loop(self, adapter):
+        """transcribe_recording shells out to a local Whisper binary for 10-25
+        seconds. Running it inline would freeze every concurrent agent run and
+        SSE stream sharing this port, so it must land on an executor thread —
+        the property the run_in_executor hop exists for."""
+        capture = {}
+        pipeline = self._pipeline({"success": True, "transcript": "x"}, capture)
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 200
+        assert capture["thread"] is not threading.main_thread()
+
+    @pytest.mark.asyncio
+    async def test_forwards_model_and_ignores_openai_extras(self, adapter):
+        """An OpenAI SDK client sends language/response_format/prompt/
+        temperature routinely. They are drained and ignored rather than 400'd;
+        only ``model`` reaches the pipeline."""
+        capture = {}
+        pipeline = self._pipeline({"success": True, "transcript": "x"}, capture)
+        extras = {
+            "model": "large-v3",
+            "language": "en",
+            "response_format": "json",
+            "prompt": "badge",
+            "temperature": "0",
+        }
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form(extras=extras))
+                assert resp.status == 200
+        assert capture["model"] == "large-v3"
+
+    @pytest.mark.asyncio
+    async def test_blank_model_field_falls_back_to_pipeline_default(self, adapter):
+        capture = {}
+        pipeline = self._pipeline({"success": True, "transcript": "x"}, capture)
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form(extras={"model": "  "}))
+                assert resp.status == 200
+        assert capture["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_silence_is_200_with_empty_text(self, adapter):
+        """Silence, or a Whisper hallucination the pipeline filtered out, is a
+        successful transcription of nothing — matching the dashboard's
+        /api/audio/transcribe. The bridge turns the empty string into its own
+        "no speech" turn; a 500 here would show the badge a hard error."""
+        pipeline = self._pipeline({"success": True, "transcript": ""})
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 200
+                assert (await resp.json())["text"] == ""
+
+    @pytest.mark.asyncio
+    async def test_pipeline_failure_is_500(self, adapter):
+        pipeline = self._pipeline({"success": False, "error": "whisper binary missing"})
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 500
+                assert (await resp.json())["error"]["type"] == "server_error"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_exception_is_500(self, adapter):
+        pipeline = self._pipeline(RuntimeError("model load exploded"))
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+                assert resp.status == 500
+                assert (await resp.json())["error"]["type"] == "server_error"
+
+    @pytest.mark.asyncio
+    async def test_temp_file_is_removed_on_success_and_on_failure(self, adapter):
+        """Every accepted upload writes a temp file; a badge that talks all day
+        must not fill the disk, so the unlink sits in a finally."""
+        for result in ({"success": True, "transcript": "x"}, RuntimeError("boom")):
+            capture = {}
+            with patch("tools.voice_mode.transcribe_recording", self._pipeline(result, capture)):
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    await cli.post("/v1/audio/transcriptions", data=self._form())
+            assert not os.path.exists(capture["path"]), result
+
+    @pytest.mark.asyncio
+    async def test_multipart_without_a_file_part_is_400(self, adapter):
+        """A well-formed multipart body whose audio part is named something
+        other than ``file`` — the mistake an OpenAI-shaped client makes — is a
+        400 naming the missing param, not a 500 from transcribing nothing."""
+        form = FormData()
+        form.add_field("audio", self.WAV, filename="turn.wav", content_type="audio/wav")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/audio/transcriptions", data=form)
+            assert resp.status == 400
+            assert (await resp.json())["error"]["param"] == "file"
+
+    @pytest.mark.asyncio
+    async def test_urlencoded_body_is_400(self, adapter):
+        """aiohttp's FormData degrades to x-www-form-urlencoded when no part
+        carries a filename, so a client that forgets the filename lands here
+        rather than on the missing-part branch."""
+        form = FormData()
+        form.add_field("model", "large-v3")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/audio/transcriptions", data=form)
+            assert resp.status == 400
+            assert (await resp.json())["error"]["code"] == "invalid_content_type"
+
+    @pytest.mark.asyncio
+    async def test_non_multipart_body_is_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/audio/transcriptions",
+                data=json.dumps({"file": "nope"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"]["code"] == "invalid_content_type"
+
+    @pytest.mark.asyncio
+    async def test_requires_bearer_token_when_key_configured(self, auth_adapter):
+        """Same auth as every other route on this port: the badge bridge holds
+        API_SERVER_KEY, so STT must not be a hole beside it."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/audio/transcriptions", data=self._form())
+            assert resp.status == 401
+            resp = await cli.post(
+                "/v1/audio/transcriptions",
+                data=self._form(),
+                headers={"Authorization": "Bearer wrong"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_configured_bearer_token(self, auth_adapter):
+        pipeline = self._pipeline({"success": True, "transcript": "authed"})
+        with patch("tools.voice_mode.transcribe_recording", pipeline):
+            app = _create_app(auth_adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=self._form(),
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                assert (await resp.json())["text"] == "authed"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_the_route(self, adapter):
+        """The capability flag and the endpoints entry must move with the
+        handler. A client that feature-detects on a stale "audio_api": False
+        would never try the route this branch exists to provide."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            data = await resp.json()
+            assert data["features"]["audio_api"] is True
+            assert data["endpoints"]["audio_transcriptions"] == {
+                "method": "POST",
+                "path": "/v1/audio/transcriptions",
+            }
 
 
 # ---------------------------------------------------------------------------
