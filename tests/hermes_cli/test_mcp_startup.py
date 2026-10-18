@@ -61,11 +61,13 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_rl(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
-            load_config=dict,
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
         ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=dict),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -144,11 +146,13 @@ def test_prepare_agent_startup_skips_discovery_when_chat_resolves_to_tui(
     )
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
-            load_config=dict,
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
         ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=dict),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -186,11 +190,13 @@ def test_prepare_agent_startup_keeps_discovery_for_non_chat_commands(
     )
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
-            load_config=dict,
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
         ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=dict),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -225,9 +231,9 @@ def test_background_mcp_discovery_suppresses_interactive_oauth(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
         ),
     )
     monkeypatch.setitem(
@@ -262,9 +268,9 @@ def test_background_mcp_discovery_propagates_profile_secret_scope(monkeypatch):
     seen = []
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
         ),
     )
     monkeypatch.setitem(
@@ -299,8 +305,8 @@ def test_background_mcp_discovery_propagates_profile_secret_scope(monkeypatch):
 def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
-        types.SimpleNamespace(read_raw_config=dict),
+        "hermes_cli.config_effective",
+        types.SimpleNamespace(load_user_config_effective=dict),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -316,9 +322,9 @@ def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
 def test_disabled_native_mcp_configuration_does_not_open_startup_gate(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {
+            load_user_config_effective=lambda: {
                 "mcp_servers": {
                     "playwright": {
                         "command": "npx",
@@ -354,9 +360,9 @@ def _retry_logger():
 def _install_retry_stubs(monkeypatch, *, connected: bool, calls: dict, status: str = "configured"):
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
+            load_user_config_effective=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
         ),
     )
     monkeypatch.setitem(

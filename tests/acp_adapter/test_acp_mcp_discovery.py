@@ -88,10 +88,10 @@ def test_acp_background_discovery_does_not_block_startup(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         _mod(
-            "hermes_cli.config",
-            read_raw_config=lambda: {"mcp_servers": {"slow": {"url": "https://mcp.example.test"}}},
+            "hermes_cli.config_effective",
+            load_user_config_effective=lambda: {"mcp_servers": {"slow": {"url": "https://mcp.example.test"}}},
         ),
     )
     monkeypatch.setitem(
@@ -137,10 +137,10 @@ def test_acp_late_refresh_adds_tools_when_discovery_lands_after_build(monkeypatc
 
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_cli.config_effective",
         _mod(
-            "hermes_cli.config",
-            read_raw_config=lambda: {"mcp_servers": {"slow": {"url": "https://mcp.example.test"}}},
+            "hermes_cli.config_effective",
+            load_user_config_effective=lambda: {"mcp_servers": {"slow": {"url": "https://mcp.example.test"}}},
         ),
     )
     monkeypatch.setitem(
