@@ -376,6 +376,7 @@ def _install_retry_stubs(monkeypatch, *, connected: bool, calls: dict, status: s
         types.SimpleNamespace(
             discover_mcp_tools=lambda: calls.__setitem__("mcp", calls["mcp"] + 1),
             get_mcp_status=lambda: [{"name": "demo", "connected": connected, "status": status}],
+            mcp_servers_awaiting_connect=list,
         ),
     )
 
